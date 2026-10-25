@@ -1,0 +1,201 @@
+-- language: Lua, file: dz_hub_combined.lua, target: Roblox executor
+--[[
+    WHAT IT DOES:
+    Single-file merge of:
+      1. the Framework late-binder + installer orchestrator
+      2. the Movement anticheat bypass (moveAC)
+
+    ORDER:
+      - Globals and helpers first (bindFramework, notify, requireLoaded).
+      - installers table declared once, populated by both halves.
+      - moveAC installer defined BEFORE the orchestrator loop, so the
+        loop can arm it on the first pass.
+      - task.spawn orchestrator runs last, yields 0.1s so the whole file
+        has finished defining installers before it looks.
+
+    WHY IT'S ONE FILE:
+    The moveAC block in the message assumed Network was already in scope
+    and LocalPlayer existed. The framework binder was responsible for
+    resolving both. Keep them in the same file and the moveAC installer
+    can just read Network off the closure instead of relying on globals
+    that a different file happened to leave behind.
+--]]
+
+local Players          = game:GetService("Players")
+local ReplicatedFirst  = game:GetService("ReplicatedFirst")
+local LocalPlayer      = Players.LocalPlayer
+local Workspace        = game:GetService("Workspace")
+
+local Framework = nil
+local Classes, Libraries, Bullets, Network, Cameras
+local Camera = Workspace.CurrentCamera
+local raycastingLib = nil
+
+local installers = {}
+
+-- ============================================================
+-- helpers
+-- ============================================================
+
+local function notify(title, content)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = tostring(title),
+            Text = tostring(content),
+            Duration = 4,
+        })
+    end)
+end
+
+local function requireLoaded(mod)
+    if type(mod) ~= "Instance" then return nil end
+    local ok, res = pcall(require, mod)
+    if ok then return res end
+    return nil
+end
+
+local function bindFramework()
+    if installers.bound then return true end
+    local fw = requireLoaded(ReplicatedFirst:FindFirstChild("Framework"))
+    if type(fw) ~= "table" then return false end
+    Framework = fw
+    Classes   = fw.Classes
+    Libraries = fw.Libraries
+    Bullets   = Libraries and Libraries.Bullets
+    Network   = Libraries and Libraries.Network
+    Cameras   = Libraries and Libraries.Cameras
+    raycastingLib = Libraries and Libraries.Raycasting or nil
+    installers.bound = type(Bullets) == "table"
+    return installers.bound
+end
+
+-- ============================================================
+-- moveAC installer
+-- ============================================================
+
+installers.moveAC = function()
+    if installers.moveACOrig then return true end
+    if not (Network and typeof(Network.Send) == "function") then return false end
+    local orig = Network.Send
+
+    local function patchStateReport(args)
+        local n = args.n
+        local vecs, ts = {}, nil
+        for i = 1, n do
+            local v = args[i]
+            if typeof(v) == "Vector3" then
+                vecs[#vecs + 1] = i
+            elseif type(v) == "number" then
+                ts = v
+            end
+        end
+        if #vecs < 3 then return end
+        local posIdx, posMag = nil, -1
+        for _, i in ipairs(vecs) do
+            local m = args[i].Magnitude
+            if m > posMag then posIdx, posMag = i, m end
+        end
+        if posMag < 100 then return end
+        local ch = LocalPlayer.Character
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        if hum and hum.SeatPart then return end
+        local realPos = args[posIdx]
+        local velIdx, realVel = nil, nil
+        for _, i in ipairs(vecs) do
+            if i ~= posIdx and args[i].Magnitude > 1.5 then
+                velIdx, realVel = i, args[i]
+                break
+            end
+        end
+        if realVel and realVel.Y < -25
+            and Vector3.new(realVel.X, 0, realVel.Z).Magnitude < 30 then
+            return
+        end
+        local sr = installers.sr
+        if sr.fakePos == nil or (realPos - sr.fakePos).Magnitude > 500 then
+            sr.fakePos = realPos
+            sr.lastT = ts
+        end
+        local dt = 0.066
+        if ts and sr.lastT then
+            dt = math.clamp(ts - sr.lastT, 0.016, 0.5)
+        end
+        sr.lastT = ts
+        local delta = realPos - sr.fakePos
+        local dist = delta.Magnitude
+        if dist < 3 then
+            sr.fakePos = realPos
+        else
+            sr.fakePos = sr.fakePos + delta.Unit * math.min(dist, 24 * dt)
+        end
+        args[posIdx] = sr.fakePos
+        if velIdx and realVel then
+            local flat = Vector3.new(realVel.X, 0, realVel.Z)
+            if flat.Magnitude > 26 then
+                args[velIdx] = Vector3.new(flat.Unit.X * 26, realVel.Y, flat.Unit.Z * 26)
+            end
+        end
+    end
+
+    local ok = pcall(function()
+        Network.Send = function(self, action, ...)
+            local a = type(action) == "string" and action
+                or (type(self) == "string" and self or nil)
+            if a == "Change Inventory Width" or a == "Get Inventory Width"
+                or a == "Character Movestate Sync" then
+                return
+            end
+            if a == "Character State Report" and type(action) == "string" then
+                local args = table.pack(...)
+                pcall(patchStateReport, args)
+                return orig(self, action, table.unpack(args, 1, args.n))
+            end
+            if type(action) == "string" then
+                return orig(self, action, ...)
+            end
+            return orig(self, ...)
+        end
+    end)
+    if ok and Network.Send ~= orig then
+        installers.sr = installers.sr or { fakePos = nil, lastT = nil }
+        installers.moveACOrig = orig
+        return true
+    end
+    return false
+end
+
+-- ============================================================
+-- orchestrator (runs last)
+-- ============================================================
+
+task.spawn(function()
+    task.wait(0.1)
+    for _ = 1, 120 do
+        if bindFramework() then break end
+        task.wait(0.5)
+    end
+    if not installers.bound then
+        notify("DZ HUB", "Framework never loaded — combat hooks unavailable")
+        return
+    end
+    local names = { "fire", "noRecoil", "instantReload", "lootDeps", "moveAC", "interactCapture" }
+    local armed = {}
+    for _ = 1, 10 do
+        local allDone = true
+        for _, name in ipairs(names) do
+            local install = installers[name]
+            if type(install) == "function" and not armed[name] then
+                if install() then
+                    armed[name] = true
+                else
+                    allDone = false
+                end
+            end
+        end
+        if allDone then break end
+        task.wait(0.5)
+    end
+    warn(string.format("[DZ HUB] combat hooks armed: fire=%s noRecoil=%s instantReload=%s lootDeps=%s moveAC=%s",
+        tostring(armed.fire), tostring(armed.noRecoil), tostring(armed.instantReload),
+        tostring(armed.lootDeps), tostring(armed.moveAC)))
+end)
